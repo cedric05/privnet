@@ -3,14 +3,14 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use futures::{SinkExt, StreamExt};
 use tokio_serde::formats::Json;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::message;
-use crate::utils;
+use crate::utils::{self, proxy};
 
 pub struct Server {
     pub tcp_listener: TcpListener,
@@ -20,7 +20,9 @@ pub struct Server {
 impl Server {
     pub async fn new(server_ip: IpAddr, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
         log::debug!("establishing socket listener");
-        let socket = TcpListener::bind((server_ip, port).clone()).await?;
+        let socket = TcpListener::bind((server_ip, port).clone()).await.expect(
+            "unable to assign server requested addr, please check port is free or ip is assignable",
+        );
         log::info!("server started started listening on {server_ip}:{port}");
         Ok(Self {
             server_ip,
@@ -30,9 +32,15 @@ impl Server {
     pub async fn start(&self) -> Result<(), Box<dyn Error>> {
         loop {
             log::debug!("waiting for new socket connection");
-            let (stream, new_conn_addr) = self.tcp_listener.accept().await?;
+            let (stream, new_conn_addr) = match self.tcp_listener.accept().await {
+                Ok((stream, new_conn_addr)) => (stream, new_conn_addr),
+                Err(error) => {
+                    log::error!("socket accept failed with error {}", error);
+                    continue;
+                }
+            };
             log::info!("new client socket connection established to server {new_conn_addr}");
-            let client_handler = ClientConnectionHandler::new(stream, self.server_ip).await?;
+            let client_handler = ClientConnectionHandler::new(stream, self.server_ip);
             tokio::spawn(async move {
                 log::debug!("waiting for client connect for {new_conn_addr}");
                 let _ = client_handler.listen().await;
@@ -50,15 +58,12 @@ pub struct ClientConnectionHandler {
         Json<message::ClientRequest, message::ServerResponse>,
     >,
     server_ip: IpAddr,
-    client_addr: std::net::SocketAddr,
+    client_addr: Option<std::net::SocketAddr>,
 }
 
 impl ClientConnectionHandler {
-    async fn new(
-        stream: TcpStream,
-        server_ip: IpAddr,
-    ) -> Result<ClientConnectionHandler, Box<dyn std::error::Error>> {
-        let client_addr = stream.peer_addr()?;
+    fn new(stream: TcpStream, server_ip: IpAddr) -> ClientConnectionHandler {
+        let client_addr = stream.peer_addr().ok();
         let frame =
             tokio_util::codec::Framed::new(stream, tokio_util::codec::LengthDelimitedCodec::new());
         let frame: tokio_serde::Framed<
@@ -67,16 +72,16 @@ impl ClientConnectionHandler {
             message::ServerResponse,
             Json<message::ClientRequest, message::ServerResponse>,
         > = tokio_serde::Framed::new(frame, tokio_serde::formats::Json::default());
-        return Ok(ClientConnectionHandler {
+        return ClientConnectionHandler {
             frame,
             client_addr,
             server_ip,
-        });
+        };
     }
     async fn listen(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let (new_connection_sender, mut new_connection_reciever) = unbounded_channel::<()>();
-        let mut socket_sender: Option<UnboundedSender<TcpStream>> = None;
+        let (new_connection_sender, mut new_connection_reciever) = unbounded_channel::<TcpStream>();
         let mut already_connected = false;
+        let mut fut: Option<tokio::task::JoinHandle<_>> = None;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(30))=>{
@@ -86,28 +91,20 @@ impl ClientConnectionHandler {
                 new_connection = new_connection_reciever.recv() => {
                     log::info!("new connection for listening port");
                     // TODO fix this match
-                    let _new_connection = match new_connection{
+                    let new_connection = match new_connection{
                         Some(new_connection) => new_connection,
                         None => continue,
                     };
-                    let client_connect_port = utils::new_port(None);
-                    log::info!("new port in which client can connect is {}", client_connect_port);
-                    self.frame.send(message::ServerResponse::NewConnection { client_connect_port }).await?;
-                    log::debug!("sent request to client {}", client_connect_port);
-                    log::debug!("listening on {}:{}", self.server_ip, client_connect_port);
-                    let client_connect_socket = TcpListener::bind((self.server_ip, client_connect_port)).await?;
-                    let (stream, remote_addr) = client_connect_socket.accept().await?;
-                    if remote_addr != self.client_addr {
-                        // TODO fix this
-                        log::debug!("getting connections from unknown ip {}", remote_addr);
-                    }
-                    match &mut socket_sender{
-                        Some(sender) => {
-                            log::debug!("sent new socket connection to");
-                            let _ = sender.send(stream)?;
-                        },
-                        None => {},
-                    }
+                    let stream = match get_new_stream_from_client(self.server_ip, &mut self.frame, self.client_addr.map(|x|x.ip())).await{
+                        Ok(stream)=> stream,
+                        Err(err) => {
+                            log::error!("unable to get connection to local net, {err}");
+                            continue;
+                        }
+                    };
+                    fut = Some(tokio::spawn(async {
+                        proxy(new_connection, stream).await;
+                    }));
                 }
                 message =  self.frame.next()=>{
                     let message = match message {
@@ -117,19 +114,22 @@ impl ClientConnectionHandler {
                             continue;
                         },
                         // TODO look for client disconnect and close loop
-                        None => continue,
+                        None => {
+                            fut.map(|x|x.abort());
+                            return Ok(())
+                        },
                     };
                     match message {
                         message::ClientRequest::Ping { seq } => {
                             log::debug!("recieved ping from client");
                             // TODO act upon failure
-                            let _ = self
+                                self
                                 .frame
                                 .send(message::ServerResponse::Pong { seq: seq })
-                                .await;
+                                .await.unwrap_or(());
                         }
                         message::ClientRequest::ClientConnect(port) => {
-                            log::info!("received cliet connect from client {}", self.client_addr);
+                            log::info!("received cliet connect from client {:?}", self.client_addr);
                             if already_connected {
                                 // for single client, there is only one client connect
                                 // if already connected, don't act
@@ -148,9 +148,7 @@ impl ClientConnectionHandler {
                                     end_user_port: port,
                                 })
                                 .await;
-                            let (_socket_sender, socket_reciever) = unbounded_channel::<TcpStream>();
-                            socket_sender = Some(_socket_sender);
-                            tokio::spawn({
+                            fut = Some(tokio::spawn({
                                 log::info!("spawned new task for accepting connections from public");
                                 let new_connection_sender = new_connection_sender.clone();
                                 async move {
@@ -158,10 +156,9 @@ impl ClientConnectionHandler {
                                     port,
                                     self.server_ip,
                                     new_connection_sender,
-                                    socket_reciever,
                                 )
                                 .await;
-                            }});
+                            }}));
                         }
                     }
                 }
@@ -172,30 +169,63 @@ impl ClientConnectionHandler {
     async fn loop_for_new_connections(
         port: u16,
         ip_addr: IpAddr,
-        sender: UnboundedSender<()>,
-        mut reciever: UnboundedReceiver<TcpStream>,
+        sender: UnboundedSender<TcpStream>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         log::debug!("creating new server for listening");
-        let socket = TcpListener::bind((ip_addr, port)).await?;
+        // here we already verified port is available.
+        let socket = TcpListener::bind((ip_addr, port)).await.unwrap();
         log::info!("new tcp server listening on {}:{}", ip_addr, port);
         loop {
             log::debug!("accepting new connection on {}:{}", ip_addr, port);
-            let (stream, remote_addr) = socket.accept().await?;
+            let (stream, remote_addr) = match socket.accept().await {
+                Ok((stream, remote_addr)) => (stream, remote_addr),
+                Err(error) => {
+                    log::error!("unable to accept new connection, {error}");
+                    continue;
+                }
+            };
             log::info!(
                 "accepted new connection on {}:{} from {}",
                 ip_addr,
                 port,
                 remote_addr
             );
-            sender.send(())?;
-            log::debug!("sent signal to request new connection from client ");
-            let stream_from_clinet = reciever.recv().await.unwrap();
-            log::debug!("recieved new connection from client");
-            tokio::spawn(async {
-                log::debug!("proxying request");
-                utils::proxy(stream, stream_from_clinet).await;
-                log::debug!("proxying complete, connection closed");
-            });
+            if let Err(error) = sender.send(stream) {
+                log::warn!("unable to send notification of new connection to client");
+                log::error!("sending message failed with error {}", error);
+                continue;
+            }
         }
     }
+}
+
+async fn get_new_stream_from_client(
+    server_ip: IpAddr,
+    frame: &mut tokio_serde::Framed<
+        Framed<TcpStream, LengthDelimitedCodec>,
+        message::ClientRequest,
+        message::ServerResponse,
+        Json<message::ClientRequest, message::ServerResponse>,
+    >,
+    client_addr: Option<IpAddr>,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let client_connect_socket = TcpListener::bind((server_ip, 0)).await?;
+    let client_connect_port = client_connect_socket.local_addr().unwrap().port();
+    log::info!(
+        "new port in which client can connect is {}",
+        client_connect_port
+    );
+    frame
+        .send(message::ServerResponse::NewConnection {
+            client_connect_port,
+        })
+        .await?;
+    log::debug!("sent request to client {}", client_connect_port);
+    log::debug!("listening on {}:{}", server_ip, client_connect_port);
+    let (stream, remote_addr) = client_connect_socket.accept().await?;
+    if Some(remote_addr.ip()) != client_addr {
+        // TODO fix this
+        log::debug!("getting connections from unknown ip {}", remote_addr);
+    }
+    Ok(stream)
 }

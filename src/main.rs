@@ -1,6 +1,7 @@
 use std::{error::Error, net::IpAddr};
 
 use clap::Parser;
+use env_logger::Env;
 use tokio;
 
 mod client;
@@ -14,7 +15,8 @@ use cmd::{ClientArgs, Commands, ServerArgs};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = cmd::CmdArgs::parse();
-    env_logger::init();
+    let env = Env::default().filter_or("RUST_LOG", "info");
+    env_logger::init_from_env(env);
     match args.command {
         Commands::Server(ServerArgs { server_ip, port }) => {
             let server_ip: IpAddr = server_ip.parse()?;

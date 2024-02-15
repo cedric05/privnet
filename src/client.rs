@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio_serde::formats::Json;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -29,7 +30,9 @@ impl Client {
         local_addr: String,
         request_port: Option<u16>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let stream = TcpStream::connect((server_ip, port)).await?;
+        let stream = TcpStream::connect((server_ip, port))
+            .await
+            .expect("Unable to connect to server");
         log::debug!("successfully connected to server");
         let server_resolv_addr = stream.local_addr()?;
         log::debug!("server resolved addr: {server_resolv_addr}");
@@ -47,8 +50,10 @@ impl Client {
         log::debug!("sending client connect to server");
         self.frame
             .send(message::ClientRequest::ClientConnect(self.request_port))
-            .await?;
+            .await
+            .expect("unable to send client connect protocol with server");
         let mut seq: u32 = 1;
+        let mut fut: Option<JoinHandle<_>> = None;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(10))=>{
@@ -59,8 +64,16 @@ impl Client {
                 message = self.frame.next() =>{
                     let message = match message {
                         Some(Ok(message)) => message,
+                        Some(Err(message))=> {
+                            log::debug!("ran into error {}", message);
+                            continue;
+                        }
                         // look for errors and gracefully exit, so that it can retry connecting to serverrecieved ping from client
-                        _ => continue,
+                        None => {
+                            log::warn!("server disconnected aborting client" );
+                            fut.map(|x| x.abort());
+                            return Ok(());
+                        },
                     };
                     match message {
                         message::ServerResponse::Ok { end_user_port } => {
@@ -68,11 +81,24 @@ impl Client {
                                 "client connect successful. server responded with port {}",
                                 end_user_port
                             );
-                            println!(
-                                "connect to server address {}:{}",
-                                self.server_ip,
-                                end_user_port
-                            );
+                            let requested_satisfied = match self.request_port.as_ref(){
+                                Some(request_port)=> request_port == &end_user_port,
+                                None=>true
+                            };
+                            if requested_satisfied {
+                                println!(
+                                    "connect to server address {}:{}",
+                                    self.server_ip,
+                                    end_user_port
+                                );
+                            } else {
+                                println!(
+                                    "server coudn't allocate requested port {:?} connect to server address {}:{}",
+                                    self.request_port,
+                                    self.server_ip,
+                                    end_user_port
+                                );
+                            }
                         }
                         message::ServerResponse::Pong { seq: _seq } => {
                             log::debug!("server responded with pong! sequence: {}", _seq);
@@ -84,21 +110,30 @@ impl Client {
                                 "server requested new connection to port {}",
                                 client_connect_port
                             );
-
-                            // tokio::time::sleep(Duration::from_secs(10)).await;
-
-                            // TODO, unable to connect to server should not crash client
-                            let server_stream =
-                                TcpStream::connect((self.server_ip, client_connect_port)).await?;
-
-                            let local_net_stream = TcpStream::connect(self.local_addr.clone()).await?;
-                            tokio::spawn(async {
-                                utils::proxy(local_net_stream, server_stream).await;
+                            // wait for 1 second for (client to setup)
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            _ = connect_server_n_local((self.server_ip, client_connect_port).into(), &self.local_addr).await.map(|(s1, s2)|{
+                                fut = Some(tokio::spawn(async {
+                                    utils::proxy(s1, s2).await;
+                                }));
                             });
+
                         }
                     }
                 }
             }
         }
     }
+}
+
+async fn connect_server_n_local(
+    server_addr: std::net::SocketAddr,
+    local_addr: &str,
+) -> Result<(TcpStream, TcpStream), Box<dyn std::error::Error>> {
+    let server_stream = TcpStream::connect(server_addr).await?;
+    let local_net_stream = TcpStream::connect(local_addr).await.map_err(|x| {
+        log::error!("looks to be local_net stream is not connectable");
+        x
+    })?;
+    Ok((server_stream, local_net_stream))
 }
