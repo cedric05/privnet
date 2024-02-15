@@ -10,5 +10,5 @@ pub enum ServerResponse {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientRequest {
     Ping { seq: u32 },
-    ClientConnect,
+    ClientConnect(Option<u16>),
 }

@@ -1,6 +1,8 @@
-use futures::{SinkExt, StreamExt};
 use std::error::Error;
+use std::net::IpAddr;
 use std::time::Duration;
+
+use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_serde::formats::Json;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -15,16 +17,19 @@ pub struct Client {
         message::ClientRequest,
         Json<message::ServerResponse, message::ClientRequest>,
     >,
-    pub sock_addr: std::net::SocketAddr,
+    pub server_ip: IpAddr,
     pub local_addr: String,
+    pub request_port: Option<u16>,
 }
 
 impl Client {
     pub async fn new(
-        server_addr: String,
+        server_ip: IpAddr,
+        port: u16,
         local_addr: String,
+        request_port: Option<u16>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let stream = TcpStream::connect(server_addr).await?;
+        let stream = TcpStream::connect((server_ip, port)).await?;
         log::debug!("successfully connected to server");
         let server_resolv_addr = stream.local_addr()?;
         log::debug!("server resolved addr: {server_resolv_addr}");
@@ -33,14 +38,15 @@ impl Client {
         let frame = tokio_serde::Framed::new(frame, tokio_serde::formats::Json::default());
         Ok(Self {
             frame,
-            sock_addr: server_resolv_addr,
+            server_ip,
             local_addr,
+            request_port,
         })
     }
     pub async fn start(mut self) -> Result<(), Box<dyn Error>> {
         log::debug!("sending client connect to server");
         self.frame
-            .send(message::ClientRequest::ClientConnect)
+            .send(message::ClientRequest::ClientConnect(self.request_port))
             .await?;
         let mut seq: u32 = 1;
         loop {
@@ -64,7 +70,7 @@ impl Client {
                             );
                             println!(
                                 "connect to server address {}:{}",
-                                self.sock_addr.ip(),
+                                self.server_ip,
                                 end_user_port
                             );
                         }
@@ -79,9 +85,11 @@ impl Client {
                                 client_connect_port
                             );
 
+                            // tokio::time::sleep(Duration::from_secs(10)).await;
+
                             // TODO, unable to connect to server should not crash client
                             let server_stream =
-                                TcpStream::connect((self.sock_addr.ip(), client_connect_port)).await?;
+                                TcpStream::connect((self.server_ip, client_connect_port)).await?;
 
                             let local_net_stream = TcpStream::connect(self.local_addr.clone()).await?;
                             tokio::spawn(async {

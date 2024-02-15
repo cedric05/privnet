@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, net::IpAddr};
 
 use clap::Parser;
 use tokio;
@@ -16,19 +16,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = cmd::CmdArgs::parse();
     env_logger::init();
     match args.command {
-        Commands::Server(ServerArgs { bind_addr }) => {
-            log::info!("starting in server mode with {bind_addr}");
-            let server_ins = server::Server::new(bind_addr).await?;
+        Commands::Server(ServerArgs { server_ip, port }) => {
+            let server_ip: IpAddr = server_ip.parse()?;
+            log::info!("starting in server mode with {server_ip}");
+            let server_ins = server::Server::new(server_ip, port).await?;
             server_ins.start().await?;
         }
         Commands::Client(ClientArgs {
             server_addr,
             local_net,
+            request_port,
         }) => {
+            let server_addr = tokio::net::lookup_host(server_addr)
+                .await
+                .expect("unable to resolve address")
+                .next()
+                .expect("unable to resolve addr");
             log::info!(
                 "starting in client mode with server addr:{server_addr} and exposing {local_net}"
             );
-            let client_ins = client::Client::new(server_addr, local_net).await?;
+            let client_ins = client::Client::new(
+                server_addr.ip(),
+                server_addr.port(),
+                local_net,
+                request_port,
+            )
+            .await?;
             client_ins.start().await?;
         }
     }

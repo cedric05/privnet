@@ -16,11 +16,15 @@ where
     println!("closing connection");
 }
 
-pub fn new_port() -> u16 {
+pub fn new_port(check_port: Option<u16>) -> u16 {
     // TODO fix unwrap
-    let server = TcpListener::bind(("0.0.0.0", 0)).unwrap();
-    // TODO fix unwrap
-    let addr = server.local_addr().unwrap();
-    println!("port is {}", addr);
-    addr.port()
+    let port = check_port.unwrap_or_default();
+    match TcpListener::bind(("0.0.0.0", port)) {
+        Ok(server) => server.local_addr().unwrap().port(),
+        Err(_) => TcpListener::bind(("0.0.0.0", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port(),
+    }
 }
