@@ -9,13 +9,11 @@ edition = "2021"
 clap = { version = "4.5.0", features = ["derive"] }
 serde = { version = "1.0.196", features = ["derive"] }
 # TODO remove unwanted features in tokio
-tokio = { version = "1.36.0", features = ["full"] }
+tokio = { version = "1.36.0", features = ["rt", "net", "io-util", "rt-multi-thread", "time", "macros"] }
 tokio-util = { version = "0.7.4", features = ["codec"] }
 tokio-serde = { version = "0.9.0", features = ["json"] }
-serde_json = "1.0.113"
 futures = { version = "0.3.30" }
-# TODO check if serde is really required
-dashmap = { version = "5.5.3", features = ["serde"] }
 log = "0.4.20"
 env_logger = "0.11.2"
-chrono = "0.4.34"
+tokio-openssl = "0.6.4"
+openssl = "0.10.63"

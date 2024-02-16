@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 use tokio_serde::formats::Json;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use crate::cmd::TlsArgs;
 use crate::message;
 use crate::utils;
 
@@ -29,6 +30,7 @@ impl Client {
         port: u16,
         local_addr: String,
         request_port: Option<u16>,
+        tls_args: TlsArgs,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = TcpStream::connect((server_ip, port))
             .await

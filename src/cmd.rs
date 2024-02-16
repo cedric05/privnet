@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 /// Simple program to greet a person
@@ -24,6 +26,9 @@ pub(crate) struct ServerArgs {
 
     #[clap(short, long, default_value_t = 1420)]
     pub(crate) port: u16,
+
+    #[command(flatten)]
+    pub(crate) tls_args: TlsArgs,
 }
 
 #[derive(Args, Debug)]
@@ -39,4 +44,19 @@ pub(crate) struct ClientArgs {
     /// Request specific port with server
     #[clap(short, long)]
     pub(crate) request_port: Option<u16>,
+
+    #[command(flatten)]
+    pub(crate) tls_args: TlsArgs,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TlsArgs {
+    #[clap(long, requires = "key")]
+    pub(crate) cert: Option<PathBuf>,
+
+    #[clap(long, requires = "ca")]
+    pub(crate) key: Option<PathBuf>,
+
+    #[clap(long, requires = "cert")]
+    pub(crate) ca: Option<PathBuf>,
 }

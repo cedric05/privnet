@@ -18,16 +18,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let env = Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
     match args.command {
-        Commands::Server(ServerArgs { server_ip, port }) => {
+        Commands::Server(ServerArgs {
+            server_ip,
+            port,
+            tls_args,
+        }) => {
             let server_ip: IpAddr = server_ip.parse()?;
             log::info!("starting in server mode with {server_ip}");
-            let server_ins = server::Server::new(server_ip, port).await?;
+            let server_ins = server::Server::new(server_ip, port, tls_args).await?;
             server_ins.start().await?;
         }
         Commands::Client(ClientArgs {
             server_addr,
             local_net,
             request_port,
+            tls_args,
         }) => {
             let server_addr = tokio::net::lookup_host(server_addr)
                 .await
@@ -42,6 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 server_addr.port(),
                 local_net,
                 request_port,
+                tls_args,
             )
             .await?;
             client_ins.start().await?;

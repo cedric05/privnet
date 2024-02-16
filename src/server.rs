@@ -1,38 +1,49 @@
 use std::error::Error;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::time::Duration;
 
+use openssl::ssl::{Ssl, SslAcceptor};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use futures::{SinkExt, StreamExt};
+use tokio_openssl::SslStream;
 use tokio_serde::formats::Json;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use crate::cmd::TlsArgs;
 use crate::message;
-use crate::utils::{self, proxy};
+use crate::utils::{self, load_acceptor, proxy};
 
 pub struct Server {
-    pub tcp_listener: TcpListener,
+    pub socket: TcpListener,
     pub server_ip: IpAddr,
+    pub acceptor: SslAcceptor,
 }
 
 impl Server {
-    pub async fn new(server_ip: IpAddr, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(
+        server_ip: IpAddr,
+        port: u16,
+        tls_args: TlsArgs,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         log::debug!("establishing socket listener");
+        let acceptor = load_acceptor(tls_args).unwrap();
         let socket = TcpListener::bind((server_ip, port).clone()).await.expect(
             "unable to assign server requested addr, please check port is free or ip is assignable",
         );
         log::info!("server started started listening on {server_ip}:{port}");
         Ok(Self {
             server_ip,
-            tcp_listener: socket,
+            socket,
+            acceptor,
         })
     }
     pub async fn start(&self) -> Result<(), Box<dyn Error>> {
         loop {
             log::debug!("waiting for new socket connection");
-            let (stream, new_conn_addr) = match self.tcp_listener.accept().await {
+            let (stream, new_conn_addr) = match self.socket.accept().await {
                 Ok((stream, new_conn_addr)) => (stream, new_conn_addr),
                 Err(error) => {
                     log::error!("socket accept failed with error {}", error);
@@ -40,11 +51,18 @@ impl Server {
                 }
             };
             log::info!("new client socket connection established to server {new_conn_addr}");
-            let client_handler = ClientConnectionHandler::new(stream, self.server_ip);
-            tokio::spawn(async move {
-                log::debug!("waiting for client connect for {new_conn_addr}");
-                let _ = client_handler.listen().await;
-                log::debug!("client disconnected {new_conn_addr}");
+            tokio::spawn({
+                let server_ip = self.server_ip.clone();
+                let acceptor = self.acceptor.clone();
+                async move {
+                    let ssl = Ssl::new(acceptor.context()).unwrap();
+                    let mut stream = SslStream::new(ssl, stream).unwrap();
+                    Pin::new(&mut stream).accept().await.unwrap();
+                    let client_handler = ClientConnectionHandler::new(stream, server_ip);
+                    log::debug!("waiting for client connect for {new_conn_addr}");
+                    let _ = client_handler.listen().await;
+                    log::debug!("client disconnected {new_conn_addr}");
+                }
             });
         }
     }
@@ -52,7 +70,7 @@ impl Server {
 
 pub struct ClientConnectionHandler {
     frame: tokio_serde::Framed<
-        Framed<TcpStream, LengthDelimitedCodec>,
+        Framed<SslStream<TcpStream>, LengthDelimitedCodec>,
         message::ClientRequest,
         message::ServerResponse,
         Json<message::ClientRequest, message::ServerResponse>,
@@ -62,12 +80,13 @@ pub struct ClientConnectionHandler {
 }
 
 impl ClientConnectionHandler {
-    fn new(stream: TcpStream, server_ip: IpAddr) -> ClientConnectionHandler {
-        let client_addr = stream.peer_addr().ok();
+    fn new(stream: SslStream<TcpStream>, server_ip: IpAddr) -> ClientConnectionHandler {
+        // TODO fix client_addr
+        let client_addr = None; // stream.peer_addr().ok();
         let frame =
             tokio_util::codec::Framed::new(stream, tokio_util::codec::LengthDelimitedCodec::new());
         let frame: tokio_serde::Framed<
-            Framed<TcpStream, LengthDelimitedCodec>,
+            Framed<SslStream<TcpStream>, LengthDelimitedCodec>,
             message::ClientRequest,
             message::ServerResponse,
             Json<message::ClientRequest, message::ServerResponse>,
@@ -202,7 +221,7 @@ impl ClientConnectionHandler {
 async fn get_new_stream_from_client(
     server_ip: IpAddr,
     frame: &mut tokio_serde::Framed<
-        Framed<TcpStream, LengthDelimitedCodec>,
+        Framed<SslStream<TcpStream>, LengthDelimitedCodec>,
         message::ClientRequest,
         message::ServerResponse,
         Json<message::ClientRequest, message::ServerResponse>,
