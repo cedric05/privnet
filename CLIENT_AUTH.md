@@ -1,0 +1,127 @@
+
+### CA
+
+1. Create a folder for all related files
+    
+    ```sh
+    mkdir ca
+    cd ca
+    ```
+
+2. Generate a key for the CA
+
+    ```sh
+    openssl genrsa -out ca.key 2048
+    ```
+
+3. Generate a self signed certificate for the CA
+
+    ```sh
+    # enter detailed information when necessary
+    openssl req -new -x509 -key ca.key -out ca.crt
+    ```
+
+### Server
+
+4. Generate an RSA key for the domain (`localhost` here)
+
+    ```sh
+    openssl genrsa -out localhost.key 2048
+    # optional: inspect the key
+    openssl rsa -in localhost.key -noout -text
+    # optional: extract pubkey
+    openssl rsa -in localhost.key -pubout -out localhost.pubkey
+    ```
+
+5. Generate a Certificate Signing Request (CSR)
+
+    ```sh
+    # enter detailed information when necessary (please make sure you enter COMMON NAME)
+    openssl req -new -key localhost.key -addext "subjectAltName = DNS:localhost" -out localhost.csr
+    # optional: inspect the csr (note: while inspecting, make sure your Signature Algorithm is not MD5 which is not accepted by many sites, upgrade your openssl if necessary)
+    openssl req -in localhost.csr -noout -text
+    ```
+
+6. Sign the domain certificate 
+
+    ```sh
+    openssl x509 -req -in localhost.csr -CA ca.crt -CAkey ca.key -CAcreateserial -extfile <(printf "subjectAltName=DNS:localhost") -out localhost.crt
+    # optional: to exam the output crt
+    openssl x509 -in localhost.crt -noout -text
+    ```
+
+7. Create another file that contains the domain certificate and the ca certificate
+
+    ```sh
+    cat localhost.crt ca.crt > localhost.bundle.crt
+    ```
+
+### Client
+
+8. Generate an RSA key for the client
+
+    ```sh
+    openssl genrsa -out client_0.key 2048
+    ```
+
+9. Generate a Certificate Signing Request (CSR), please note that the SAN extension is NECESSARY 
+
+    ```sh
+    # enter detailed information when necessary (please make sure you enter COMMON NAME)
+    openssl req -new -key client_0.key -addext "subjectAltName = DNS:localhost" -out client_0.csr
+    ```
+
+10. Use CA key to sign it
+
+    ```sh
+    openssl x509 -req -in client_0.csr -CA ca.crt -CAkey ca.key -CAcreateserial -extfile <(printf "subjectAltName=DNS:localhost") -out client_0.crt
+    ```
+
+11. Generate pem file to test with curl & browser
+
+    ```sh
+    # generate pem file
+    cat client_0.crt client_0.key > client_0.pem
+    # optional: test command (after starting the server) using .pem file
+    curl -L  https://localhost:3030/ --cacert ca.crt --cert client_0.pem -v
+    # generate cert file to use with browser (setting password to be 123456 for example)
+    openssl pkcs12 -export -in client_0.pem -out client_0.p12 -name "client_0"
+    # optional: test command (after starting the server) using .p12 file
+    curl -L  https://localhost:3030/ --cacert ca.crt --cert-type P12 --cert client_0.p12:123456 -v
+    ```
+
+### Optional
+
+12. Create certificates for more clients
+
+    ```sh
+    export CLIENT_NAME=client_1
+    openssl genrsa -out ${CLIENT_NAME}.key 2048
+    openssl req -new -key ${CLIENT_NAME}.key -addext "subjectAltName = DNS:localhost" -out ${CLIENT_NAME}.csr
+    ```
+    ```sh
+    # after answering the prompt above
+    openssl x509 -req -in ${CLIENT_NAME}.csr -CA ca.crt -CAkey ca.key -CAcreateserial -extfile <(printf "subjectAltName=DNS:localhost") -out ${CLIENT_NAME}.crt
+    cat ${CLIENT_NAME}.crt ${CLIENT_NAME}.key > ${CLIENT_NAME}.pem
+    openssl pkcs12 -export -in ${CLIENT_NAME}.pem -out ${CLIENT_NAME}.p12 -name "${CLIENT_NAME}"
+    # enter a password (e.g. 123456 (plz don't use weak password in real-world deployment))
+    ```
+
+13. Generate multiple CAs
+
+    ```sh
+    # generate a second CA
+    openssl genrsa -out second_ca.key 2048
+    openssl req -new -x509 -key second_ca.key -out second_ca.crt
+    # answer the prompt
+
+    export CLIENT_NAME=second_client
+    openssl genrsa -out ${CLIENT_NAME}.key 2048
+    openssl req -new -key ${CLIENT_NAME}.key -addext "subjectAltName = DNS:localhost" -out ${CLIENT_NAME}.csr
+    # answer the prompt
+    
+    openssl x509 -req -in ${CLIENT_NAME}.csr -CA second_ca.crt -CAkey second_ca.key -CAcreateserial -extfile <(printf "subjectAltName=DNS:localhost") -out ${CLIENT_NAME}.crt
+    cat ${CLIENT_NAME}.crt ${CLIENT_NAME}.key > ${CLIENT_NAME}.pem
+    openssl pkcs12 -export -in ${CLIENT_NAME}.pem -out ${CLIENT_NAME}.p12 -name "${CLIENT_NAME}"
+    # enter a password (e.g. 123456 (plz don't use weak password in real-world deployment))
+    ```

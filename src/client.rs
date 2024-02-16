@@ -1,16 +1,22 @@
 use std::error::Error;
+use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
+use rustls::pki_types;
+use tokio::net::TcpStream as TokioTcpStream;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
 use tokio_serde::formats::Json;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::cmd::TlsArgs;
 use crate::message;
 use crate::utils;
+use crate::utils::get_client_config;
+
+type TcpStream = tokio_rustls::client::TlsStream<TokioTcpStream>;
 
 pub struct Client {
     pub frame: tokio_serde::Framed<
@@ -32,12 +38,20 @@ impl Client {
         request_port: Option<u16>,
         tls_args: TlsArgs,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let stream = TcpStream::connect((server_ip, port))
+        let config = get_client_config(&tls_args);
+        let connector = TlsConnector::from(config);
+        let stream = TokioTcpStream::connect((server_ip, port))
             .await
             .expect("Unable to connect to server");
+
+        let domain = pki_types::ServerName::try_from("localhost")
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?
+            .to_owned();
+
+        let stream = connector.connect(domain, stream).await?;
         log::debug!("successfully connected to server");
-        let server_resolv_addr = stream.local_addr()?;
-        log::debug!("server resolved addr: {server_resolv_addr}");
+        // let server_resolv_addr = stream.local_addr()?;
+        // log::debug!("server resolved addr: {server_resolv_addr}");
         let frame =
             tokio_util::codec::Framed::new(stream, tokio_util::codec::LengthDelimitedCodec::new());
         let frame = tokio_serde::Framed::new(frame, tokio_serde::formats::Json::default());
@@ -131,9 +145,9 @@ impl Client {
 async fn connect_server_n_local(
     server_addr: std::net::SocketAddr,
     local_addr: &str,
-) -> Result<(TcpStream, TcpStream), Box<dyn std::error::Error>> {
-    let server_stream = TcpStream::connect(server_addr).await?;
-    let local_net_stream = TcpStream::connect(local_addr).await.map_err(|x| {
+) -> Result<(TokioTcpStream, TokioTcpStream), Box<dyn std::error::Error>> {
+    let server_stream = TokioTcpStream::connect(server_addr).await?;
+    let local_net_stream = TokioTcpStream::connect(local_addr).await.map_err(|x| {
         log::error!("looks to be local_net stream is not connectable");
         x
     })?;
