@@ -1,76 +1,73 @@
 use std::error::Error;
 use std::net::IpAddr;
-use std::pin::Pin;
 use std::time::Duration;
 
-use openssl::ssl::{Ssl, SslAcceptor};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use futures::{SinkExt, StreamExt};
-use tokio_openssl::SslStream;
+use tokio_rustls::TlsAcceptor;
 use tokio_serde::formats::Json;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::cmd::TlsArgs;
 use crate::message;
-use crate::utils::{self, load_acceptor, proxy};
+use crate::utils::{self, get_server_config, proxy};
+
+type TlsTcpStream = tokio_rustls::server::TlsStream<TcpStream>;
 
 pub struct Server {
-    pub socket: TcpListener,
+    pub tcp_listener: TcpListener,
     pub server_ip: IpAddr,
-    pub acceptor: SslAcceptor,
+    pub tls_args: TlsArgs,
 }
 
 impl Server {
     pub async fn new(
         server_ip: IpAddr,
         port: u16,
-        tls_args: TlsArgs,
+        tls: TlsArgs,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         log::debug!("establishing socket listener");
-        let acceptor = load_acceptor(tls_args).unwrap();
+
         let socket = TcpListener::bind((server_ip, port).clone()).await.expect(
             "unable to assign server requested addr, please check port is free or ip is assignable",
         );
         log::info!("server started started listening on {server_ip}:{port}");
         Ok(Self {
             server_ip,
-            socket,
-            acceptor,
+            tcp_listener: socket,
+            tls_args: tls,
         })
     }
     pub async fn start(&self) -> Result<(), Box<dyn Error>> {
+        let config = get_server_config(&self.tls_args);
+        let acceptor = TlsAcceptor::from(config);
         loop {
             log::debug!("waiting for new socket connection");
-            let (stream, new_conn_addr) = match self.socket.accept().await {
+            let (stream, new_conn_addr) = match self.tcp_listener.accept().await {
                 Ok((stream, new_conn_addr)) => (stream, new_conn_addr),
                 Err(error) => {
                     log::error!("socket accept failed with error {}", error);
                     continue;
                 }
             };
+            let stream = acceptor.accept(stream).await?;
             log::info!("new client socket connection established to server {new_conn_addr}");
-            tokio::spawn({
-                let server_ip = self.server_ip.clone();
-                let acceptor = self.acceptor.clone();
-                async move {
-                    let ssl = Ssl::new(acceptor.context()).unwrap();
-                    let mut stream = SslStream::new(ssl, stream).unwrap();
-                    Pin::new(&mut stream).accept().await.unwrap();
-                    let client_handler = ClientConnectionHandler::new(stream, server_ip);
-                    log::debug!("waiting for client connect for {new_conn_addr}");
-                    let _ = client_handler.listen().await;
-                    log::debug!("client disconnected {new_conn_addr}");
-                }
+            let client_handler = ClientConnectionHandler::new(stream, self.server_ip);
+            tokio::spawn(async move {
+                log::debug!("waiting for client connect for {new_conn_addr}");
+                let _ = client_handler.loop_client().await;
+                log::debug!("client disconnected {new_conn_addr}");
             });
         }
     }
 }
 
-pub struct ClientConnectionHandler {
+pub struct ClientConnectionHandler<T> {
     frame: tokio_serde::Framed<
-        Framed<SslStream<TcpStream>, LengthDelimitedCodec>,
+        Framed<T, LengthDelimitedCodec>,
         message::ClientRequest,
         message::ServerResponse,
         Json<message::ClientRequest, message::ServerResponse>,
@@ -79,14 +76,16 @@ pub struct ClientConnectionHandler {
     client_addr: Option<std::net::SocketAddr>,
 }
 
-impl ClientConnectionHandler {
-    fn new(stream: SslStream<TcpStream>, server_ip: IpAddr) -> ClientConnectionHandler {
-        // TODO fix client_addr
+impl<T> ClientConnectionHandler<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(stream: T, server_ip: IpAddr) -> ClientConnectionHandler<T> {
         let client_addr = None; // stream.peer_addr().ok();
         let frame =
             tokio_util::codec::Framed::new(stream, tokio_util::codec::LengthDelimitedCodec::new());
         let frame: tokio_serde::Framed<
-            Framed<SslStream<TcpStream>, LengthDelimitedCodec>,
+            Framed<T, LengthDelimitedCodec>,
             message::ClientRequest,
             message::ServerResponse,
             Json<message::ClientRequest, message::ServerResponse>,
@@ -97,7 +96,7 @@ impl ClientConnectionHandler {
             server_ip,
         };
     }
-    async fn listen(mut self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn loop_client(mut self) -> Result<(), Box<dyn std::error::Error>> {
         let (new_connection_sender, mut new_connection_reciever) = unbounded_channel::<TcpStream>();
         let mut already_connected = false;
         let mut fut: Option<tokio::task::JoinHandle<_>> = None;
@@ -171,7 +170,7 @@ impl ClientConnectionHandler {
                                 log::info!("spawned new task for accepting connections from public");
                                 let new_connection_sender = new_connection_sender.clone();
                                 async move {
-                                let _ = ClientConnectionHandler::loop_for_new_connections(
+                                let _ = loop_for_new_connections(
                                     port,
                                     self.server_ip,
                                     new_connection_sender,
@@ -184,50 +183,53 @@ impl ClientConnectionHandler {
             }
         }
     }
+}
 
-    async fn loop_for_new_connections(
-        port: u16,
-        ip_addr: IpAddr,
-        sender: UnboundedSender<TcpStream>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        log::debug!("creating new server for listening");
-        // here we already verified port is available.
-        let socket = TcpListener::bind((ip_addr, port)).await.unwrap();
-        log::info!("new tcp server listening on {}:{}", ip_addr, port);
-        loop {
-            log::debug!("accepting new connection on {}:{}", ip_addr, port);
-            let (stream, remote_addr) = match socket.accept().await {
-                Ok((stream, remote_addr)) => (stream, remote_addr),
-                Err(error) => {
-                    log::error!("unable to accept new connection, {error}");
-                    continue;
-                }
-            };
-            log::info!(
-                "accepted new connection on {}:{} from {}",
-                ip_addr,
-                port,
-                remote_addr
-            );
-            if let Err(error) = sender.send(stream) {
-                log::warn!("unable to send notification of new connection to client");
-                log::error!("sending message failed with error {}", error);
+async fn loop_for_new_connections(
+    port: u16,
+    ip_addr: IpAddr,
+    sender: UnboundedSender<TcpStream>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    log::debug!("creating new server for listening");
+    // here we already verified port is available.
+    let socket = TcpListener::bind((ip_addr, port)).await.unwrap();
+    log::info!("new tcp server listening on {}:{}", ip_addr, port);
+    loop {
+        log::debug!("accepting new connection on {}:{}", ip_addr, port);
+        let (stream, remote_addr) = match socket.accept().await {
+            Ok((stream, remote_addr)) => (stream, remote_addr),
+            Err(error) => {
+                log::error!("unable to accept new connection, {error}");
                 continue;
             }
+        };
+        log::info!(
+            "accepted new connection on {}:{} from {}",
+            ip_addr,
+            port,
+            remote_addr
+        );
+        if let Err(error) = sender.send(stream) {
+            log::warn!("unable to send notification of new connection to client");
+            log::error!("sending message failed with error {}", error);
+            continue;
         }
     }
 }
 
-async fn get_new_stream_from_client(
+async fn get_new_stream_from_client<T>(
     server_ip: IpAddr,
     frame: &mut tokio_serde::Framed<
-        Framed<SslStream<TcpStream>, LengthDelimitedCodec>,
+        Framed<T, LengthDelimitedCodec>,
         message::ClientRequest,
         message::ServerResponse,
         Json<message::ClientRequest, message::ServerResponse>,
     >,
     client_addr: Option<IpAddr>,
-) -> Result<TcpStream, Box<dyn std::error::Error>> {
+) -> Result<TcpStream, Box<dyn std::error::Error>>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let client_connect_socket = TcpListener::bind((server_ip, 0)).await?;
     let client_connect_port = client_connect_socket.local_addr().unwrap().port();
     log::info!(

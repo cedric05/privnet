@@ -9,6 +9,7 @@ mod cmd;
 mod message;
 mod server;
 mod utils;
+mod tls_utils;
 
 use cmd::{ClientArgs, Commands, ServerArgs};
 
